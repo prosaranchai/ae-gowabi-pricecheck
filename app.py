@@ -41,9 +41,8 @@ with st.sidebar:
     search_inhouse = st.checkbox("🏪 เว็บร้านเอง", value=True)
 
     st.markdown("---")
-    st.markdown("## ⚡ Concurrency")
-    concurrency = st.slider("ค้นหาพร้อมกัน (rows)", 1, 3, 1)
-    st.caption("แนะนำ 1-2 เพื่อลด rate limit")
+    st.markdown("## 🐛 Debug Mode")
+    debug_mode = st.checkbox("แสดง raw response จาก AI (สำหรับ troubleshoot)", value=False)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def fmt(n):
@@ -84,7 +83,7 @@ def extract_core_keyword(service_name: str) -> str:
     return name[:80]
 
 
-def search_one_platform(client, core_name: str, shop_name: str, platform: str) -> dict:
+def search_one_platform(client, core_name: str, shop_name: str, platform: str, debug: bool = False) -> dict:
     """Search a single platform with retry logic."""
     clean_shop = re.sub(r'\(.*?\)', '', str(shop_name)).strip() if shop_name and str(shop_name).strip() not in ["", "nan"] else ""
 
@@ -122,33 +121,47 @@ def search_one_platform(client, core_name: str, shop_name: str, platform: str) -
             )
             text = "".join(b.text for b in resp.content if hasattr(b, "text"))
 
-            # Try strict single-line JSON first
+            # Count how many web_search tool uses happened
+            search_count = sum(1 for b in resp.content if getattr(b, "type", "") == "tool_use")
+
+            if debug:
+                st.markdown(f"**🔍 [{platform}] attempt {attempt+1}** — web_search calls: `{search_count}`")
+                st.code(text[:800] if text else "(no text output)", language="text")
+                # Show all content block types
+                block_types = [getattr(b, "type", "?") for b in resp.content]
+                st.caption(f"Content blocks: {block_types}")
+
             m = re.search(r'\{[^{}]+\}', text)
             if not m:
-                # Try multiline JSON
                 m = re.search(r'\{[\s\S]*?\}', text)
             if m:
                 result = json.loads(m.group())
                 result["platform"] = platform
                 return result
+            else:
+                if debug:
+                    st.warning(f"⚠️ [{platform}] ไม่พบ JSON ใน response")
+
         except Exception as e:
+            if debug:
+                st.error(f"❌ [{platform}] attempt {attempt+1} error: {e}")
             if attempt < MAX_RETRY - 1:
-                time.sleep(3 * (attempt + 1))   # backoff: 3s, 6s, 9s
+                time.sleep(3 * (attempt + 1))
             continue
 
     return {"found": False, "minPrice": None, "maxPrice": None, "discount": None,
             "topItem": None, "url": None, "note": f"ไม่สำเร็จหลัง {MAX_RETRY} ครั้ง", "platform": platform}
 
 
-def search_competitor_prices(api_key, service_name, shop_name, platforms):
+def search_competitor_prices(api_key, service_name, shop_name, platforms, debug=False):
     client = anthropic.Anthropic(api_key=api_key)
     core_name = extract_core_keyword(service_name)
     results = []
     for p in platforms:
-        r = search_one_platform(client, core_name, shop_name, p)
+        r = search_one_platform(client, core_name, shop_name, p, debug=debug)
         r["platform"] = p
         results.append(r)
-        time.sleep(2)   # delay ระหว่าง platform เพื่อหลีก rate limit
+        time.sleep(2)
     return {"search_keyword": core_name, "results": results}
 
 
@@ -284,7 +297,7 @@ if st.button("🔍 เริ่มค้นหาราคา", type="primary", 
     for i, row in df_filtered.iterrows():
         status_text.markdown(f"⏳ **{i+1}/{total}** — กำลังค้นหา: *{row['service_name'][:60]}...*")
         try:
-            data = search_competitor_prices(api_key, row["service_name"], row["shop_name"], active_platforms)
+            data = search_competitor_prices(api_key, row["service_name"], row["shop_name"], active_platforms, debug=debug_mode)
             results_store[i] = {"ok": True, "data": data}
         except Exception as e:
             results_store[i] = {"ok": False, "error": str(e)}
