@@ -73,79 +73,83 @@ def compare_badge(gowabi_low, competitor_price):
         return ""
 
 def extract_core_keyword(service_name: str) -> str:
-    """ตัดชื่อ Gowabi ที่ยาวออกเหลือแค่ core service keyword สำหรับ search."""
+    """ตัดชื่อ Gowabi ที่ยาวออกเหลือแค่ core service keyword."""
     name = str(service_name)
-    # ตัดทุกอย่างหลังวงเล็บแรก หรือ dash ที่มีคำว่า Free/Performed/Authentic
     name = re.sub(r'\s*[-–]\s*(Free|Performed|Authentic|Unboxed|Doctor|Senior|Professor|Buy|100%|Please).*', '', name, flags=re.IGNORECASE)
     name = re.sub(r'\s*\((?:Performed|Authentic|Unboxed|Senior|Professor|Buy \d|100%|Please|Free|Doctor)[^)]*\)', '', name, flags=re.IGNORECASE)
-    name = re.sub(r'\s*\[.*?\]', '', name)           # ตัด [Flash Sale eVoucher] ฯลฯ
-    name = re.sub(r'\s*\*+.*', '', name)              # ตัด * หมายเหตุ
-    name = re.sub(r'".*?"', '', name)                 # ตัดข้อความใน quote
+    name = re.sub(r'\s*\[.*?\]', '', name)
+    name = re.sub(r'\s*\*+.*', '', name)
+    name = re.sub(r'".*?"', '', name)
     name = re.sub(r'\s{2,}', ' ', name).strip()
-    return name[:80]  # จำกัดความยาว
+    return name[:80]
+
+
+def search_one_platform(client, core_name: str, shop_name: str, platform: str) -> dict:
+    """Search a single platform with retry logic."""
+    clean_shop = re.sub(r'\(.*?\)', '', str(shop_name)).strip() if shop_name and str(shop_name).strip() not in ["", "nan"] else ""
+
+    if platform == "HD Mall":
+        site = "hdmall.co.th"
+        hint = f'ค้นหาราคา "{core_name}" บนเว็บไซต์ hdmall.co.th'
+    elif platform == "Klook":
+        site = "klook.com"
+        hint = f'ค้นหาราคา "{core_name}" สำหรับ Thailand บน klook.com'
+    else:
+        site = f"เว็บ {clean_shop}" if clean_shop else "เว็บร้านค้า"
+        hint = f'ค้นหาราคา "{core_name}" จากเว็บไซต์ทางการของ {clean_shop}' if clean_shop else f'ค้นหาราคา "{core_name}"'
+
+    prompt = f"""{hint}
+
+ขั้นตอน:
+1. ใช้ web search ค้นหา: {core_name} {site}
+2. เปิดดูหน้าผลลัพธ์ที่เกี่ยวข้องมากที่สุด
+3. ดึงราคาออกมา (ใกล้เคียงก็ได้ ไม่ต้องตรงทุกคำ)
+
+ตอบด้วย JSON บรรทัดเดียวเท่านั้น ห้ามมีข้อความอื่นก่อนหรือหลัง:
+{{"found": true, "minPrice": 1500, "maxPrice": 2000, "discount": null, "topItem": "ชื่อ package", "url": "https://...", "note": "หมายเหตุ"}}
+
+หรือถ้าไม่พบ:
+{{"found": false, "minPrice": null, "maxPrice": null, "discount": null, "topItem": null, "url": null, "note": "เหตุผลที่ไม่พบ"}}"""
+
+    MAX_RETRY = 3
+    for attempt in range(MAX_RETRY):
+        try:
+            resp = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=800,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = "".join(b.text for b in resp.content if hasattr(b, "text"))
+
+            # Try strict single-line JSON first
+            m = re.search(r'\{[^{}]+\}', text)
+            if not m:
+                # Try multiline JSON
+                m = re.search(r'\{[\s\S]*?\}', text)
+            if m:
+                result = json.loads(m.group())
+                result["platform"] = platform
+                return result
+        except Exception as e:
+            if attempt < MAX_RETRY - 1:
+                time.sleep(3 * (attempt + 1))   # backoff: 3s, 6s, 9s
+            continue
+
+    return {"found": False, "minPrice": None, "maxPrice": None, "discount": None,
+            "topItem": None, "url": None, "note": f"ไม่สำเร็จหลัง {MAX_RETRY} ครั้ง", "platform": platform}
 
 
 def search_competitor_prices(api_key, service_name, shop_name, platforms):
     client = anthropic.Anthropic(api_key=api_key)
-    platform_names = ", ".join(platforms)
-
-    # ย่อชื่อบริการให้กระชับก่อน search
     core_name = extract_core_keyword(service_name)
-    shop_ctx = f'ร้าน/คลินิก: "{shop_name}"' if shop_name and str(shop_name).strip() not in ["", "nan"] else "ไม่ระบุร้าน"
-
-    search_queries = []
+    results = []
     for p in platforms:
-        if p == "HD Mall":
-            search_queries.append(f'site:hdmall.co.th "{core_name}"')
-            search_queries.append(f'hdmall.co.th {core_name} ราคา')
-        elif p == "Klook":
-            search_queries.append(f'site:klook.com {core_name} Thailand')
-            search_queries.append(f'klook Thailand {core_name}')
-        elif p == "เว็บร้านเอง" and shop_name and str(shop_name).strip() not in ["", "nan"]:
-            clean_shop = re.sub(r'\(.*?\)', '', str(shop_name)).strip()
-            search_queries.append(f'{clean_shop} {core_name} ราคา')
-
-    prompt = f"""ค้นหาราคาบริการ "{core_name}" (ชื่อเต็ม: "{service_name[:80]}")
-จาก {shop_ctx} บน platform: {platform_names}
-
-วิธีค้นหา — ค้นแยกทีละ platform:
-{"- HD Mall: ค้น hdmall.co.th ด้วยคำ: " + core_name if "HD Mall" in platforms else ""}
-{"- Klook: ค้น klook.com (Thailand/Bangkok/wellness/spa) ด้วยคำ: " + core_name if "Klook" in platforms else ""}
-{"- เว็บร้านเอง: Google ชื่อร้าน + บริการ เช่น: " + re.sub(r'\\(.*?\\)', '', str(shop_name)).strip() + " " + core_name if "เว็บร้านเอง" in platforms else ""}
-
-กฎสำคัญ:
-1. ถ้าเจอบริการใกล้เคียง (ไม่จำเป็นต้องตรงทั้งหมด) ให้ found = true และระบุ topItem
-2. ถ้า platform นั้นไม่มีบริการประเภทนี้เลย ให้ found = false
-3. ค้นให้ได้ราคาจริง อย่าเดา
-
-ตอบเป็น JSON เท่านั้น:
-{{
-  "search_keyword": "{core_name}",
-  "results": [
-    {{
-      "platform": "ชื่อ platform",
-      "found": true หรือ false,
-      "minPrice": ตัวเลขหรือ null,
-      "maxPrice": ตัวเลขหรือ null,
-      "discount": เปอร์เซ็นต์ส่วนลดหรือ null,
-      "topItem": "ชื่อแพ็คเกจที่เจอ หรือ null",
-      "url": "url หรือ null",
-      "note": "หมายเหตุ เช่น ไม่มีบริการนี้บน platform นี้เลย"
-    }}
-  ]
-}}"""
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": prompt}]
-    )
-    text = "".join(b.text for b in response.content if hasattr(b, "text"))
-    m = re.search(r"\{[\s\S]*\}", text)
-    if not m:
-        raise ValueError("ไม่พบ JSON")
-    return json.loads(m.group())
+        r = search_one_platform(client, core_name, shop_name, p)
+        r["platform"] = p
+        results.append(r)
+        time.sleep(2)   # delay ระหว่าง platform เพื่อหลีก rate limit
+    return {"search_keyword": core_name, "results": results}
 
 
 def load_file(uploaded):
@@ -261,6 +265,14 @@ if not active_platforms:
 
 # ── Run ──
 if st.button("🔍 เริ่มค้นหาราคา", type="primary", use_container_width=True):
+    # Time estimate: ~15-20 sec per row (3 platforms × ~5s each + delays)
+    est_min = len(df_filtered) * 15 // 60
+    est_max = len(df_filtered) * 25 // 60
+    est_sec = len(df_filtered) * 20
+    if est_sec < 60:
+        st.info(f"⏱️ ประมาณเวลา: **{est_sec} วินาที** ({len(df_filtered)} รายการ × ~20 วิ/รายการ)")
+    else:
+        st.info(f"⏱️ ประมาณเวลา: **{est_min}–{est_max} นาที** ({len(df_filtered)} รายการ × ~20 วิ/รายการ) — ช้าแต่ได้ผลลัพธ์จริงครับ")
     total = len(df_filtered)
     results_store = [None] * total
 
