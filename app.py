@@ -72,21 +72,55 @@ def compare_badge(gowabi_low, competitor_price):
     except:
         return ""
 
+def extract_core_keyword(service_name: str) -> str:
+    """ตัดชื่อ Gowabi ที่ยาวออกเหลือแค่ core service keyword สำหรับ search."""
+    name = str(service_name)
+    # ตัดทุกอย่างหลังวงเล็บแรก หรือ dash ที่มีคำว่า Free/Performed/Authentic
+    name = re.sub(r'\s*[-–]\s*(Free|Performed|Authentic|Unboxed|Doctor|Senior|Professor|Buy|100%|Please).*', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'\s*\((?:Performed|Authentic|Unboxed|Senior|Professor|Buy \d|100%|Please|Free|Doctor)[^)]*\)', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'\s*\[.*?\]', '', name)           # ตัด [Flash Sale eVoucher] ฯลฯ
+    name = re.sub(r'\s*\*+.*', '', name)              # ตัด * หมายเหตุ
+    name = re.sub(r'".*?"', '', name)                 # ตัดข้อความใน quote
+    name = re.sub(r'\s{2,}', ' ', name).strip()
+    return name[:80]  # จำกัดความยาว
+
+
 def search_competitor_prices(api_key, service_name, shop_name, platforms):
     client = anthropic.Anthropic(api_key=api_key)
     platform_names = ", ".join(platforms)
+
+    # ย่อชื่อบริการให้กระชับก่อน search
+    core_name = extract_core_keyword(service_name)
     shop_ctx = f'ร้าน/คลินิก: "{shop_name}"' if shop_name and str(shop_name).strip() not in ["", "nan"] else "ไม่ระบุร้าน"
 
-    prompt = f"""ค้นหาราคาบริการ "{service_name}" จาก {shop_ctx}
-บน platform ต่อไปนี้: {platform_names}
+    search_queries = []
+    for p in platforms:
+        if p == "HD Mall":
+            search_queries.append(f'site:hdmall.co.th "{core_name}"')
+            search_queries.append(f'hdmall.co.th {core_name} ราคา')
+        elif p == "Klook":
+            search_queries.append(f'site:klook.com {core_name} Thailand')
+            search_queries.append(f'klook Thailand {core_name}')
+        elif p == "เว็บร้านเอง" and shop_name and str(shop_name).strip() not in ["", "nan"]:
+            clean_shop = re.sub(r'\(.*?\)', '', str(shop_name)).strip()
+            search_queries.append(f'{clean_shop} {core_name} ราคา')
 
-แนวทางการค้นหา:
-- HD Mall: ค้นหาใน hdmall.co.th
-- Klook: ค้นหาใน klook.com (Thailand)
-- เว็บร้านเอง: ค้นหาเว็บไซต์ทางการของร้านนั้น
+    prompt = f"""ค้นหาราคาบริการ "{core_name}" (ชื่อเต็ม: "{service_name[:80]}")
+จาก {shop_ctx} บน platform: {platform_names}
 
-ตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่น:
+วิธีค้นหา — ค้นแยกทีละ platform:
+{"- HD Mall: ค้น hdmall.co.th ด้วยคำ: " + core_name if "HD Mall" in platforms else ""}
+{"- Klook: ค้น klook.com (Thailand/Bangkok/wellness/spa) ด้วยคำ: " + core_name if "Klook" in platforms else ""}
+{"- เว็บร้านเอง: Google ชื่อร้าน + บริการ เช่น: " + re.sub(r'\\(.*?\\)', '', str(shop_name)).strip() + " " + core_name if "เว็บร้านเอง" in platforms else ""}
+
+กฎสำคัญ:
+1. ถ้าเจอบริการใกล้เคียง (ไม่จำเป็นต้องตรงทั้งหมด) ให้ found = true และระบุ topItem
+2. ถ้า platform นั้นไม่มีบริการประเภทนี้เลย ให้ found = false
+3. ค้นให้ได้ราคาจริง อย่าเดา
+
+ตอบเป็น JSON เท่านั้น:
 {{
+  "search_keyword": "{core_name}",
   "results": [
     {{
       "platform": "ชื่อ platform",
@@ -96,14 +130,14 @@ def search_competitor_prices(api_key, service_name, shop_name, platforms):
       "discount": เปอร์เซ็นต์ส่วนลดหรือ null,
       "topItem": "ชื่อแพ็คเกจที่เจอ หรือ null",
       "url": "url หรือ null",
-      "note": "หมายเหตุสั้นๆ"
+      "note": "หมายเหตุ เช่น ไม่มีบริการนี้บน platform นี้เลย"
     }}
   ]
 }}"""
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=1000,
+        max_tokens=2000,
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
         messages=[{"role": "user", "content": prompt}]
     )
@@ -244,10 +278,14 @@ if st.button("🔍 เริ่มค้นหาราคา", type="primary", 
             results_store[i] = {"ok": False, "error": str(e)}
 
         # Build display row
+        core_kw = extract_core_keyword(row["service_name"])
         r_display = {
             "#": i + 1,
-            "บริการ": str(row["service_name"])[:55] + ("…" if len(str(row["service_name"])) > 55 else ""),
+            "Service ID": str(row.get("service_id", "")).replace(".0", ""),
+            "บริการ (Gowabi)": str(row["service_name"])[:55] + ("…" if len(str(row["service_name"])) > 55 else ""),
+            "🔍 keyword ที่ค้นหา": core_kw[:45],
             "ร้าน": str(row.get("shop_name", ""))[:30],
+            "นาที": str(row.get("duration", "")).replace(".0", ""),
             "Gowabi ปกติ": fmt(row.get("gowabi_normal")),
             "Gowabi ต่ำสุด": fmt(row.get("gowabi_lowest")),
         }
