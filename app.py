@@ -26,12 +26,11 @@ st.markdown("""
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ ตั้งค่า")
-    api_key = st.text_input("🔑 Anthropic API Key", type="password", placeholder="sk-ant-...")
+    api_key = st.text_input("🔑 Anthropic API Key", type="password", placeholder="sk-ant-... (ไม่บังคับ)")
     if api_key:
         st.success("✅ API Key พร้อมใช้งาน")
     else:
-        st.warning("กรุณาใส่ API Key")
-        st.markdown("[ขอ API Key →](https://console.anthropic.com/)")
+        st.info("ℹ️ ไม่ต้องใช้ API Key แล้ว — ค้นหาตรงจาก HD Mall / Klook / DuckDuckGo")
 
     st.markdown("---")
     st.markdown("## 📱 Platform เป้าหมาย")
@@ -93,192 +92,115 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-def extract_price_from_text(text: str) -> int | None:
-    """Extract first numeric price (฿ or บาท pattern) from text."""
-    text = text.replace(",", "")
-    patterns = [
-        r'฿\s*(\d{2,6})',
-        r'(\d{2,6})\s*บาท',
-        r'(\d{2,6})\s*THB',
-        r'price["\s:]+(\d{2,6})',
-        r'"price"\s*:\s*(\d{2,6})',
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            val = int(m.group(1))
-            if 50 <= val <= 999999:   # sanity check
-                return val
-    return None
-
-def search_hdmall(keyword: str, debug: bool = False) -> dict:
+def ddg_search_price(keyword: str, site: str, debug: bool = False) -> dict:
+    """Search DuckDuckGo HTML for prices on a specific site."""
     try:
-        q = urllib.parse.quote(keyword)
-        url = f"https://hdmall.co.th/search?q={q}"
-        r = requests.get(url, headers=HEADERS, timeout=12)
-        soup = BeautifulSoup(r.text, "lxml")
+        query = f'site:{site} {keyword} ราคา'
+        q = urllib.parse.quote(query)
+        url = f"https://html.duckduckgo.com/html/?q={q}&kl=th-th"
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
 
         if debug:
-            st.caption(f"HD Mall status: {r.status_code} | url: {url}")
+            st.caption(f"DDG [{site}] status={r.status_code} query={query}")
 
-        # Find price elements — HD Mall uses data-price or .price class
         prices = []
-        items = []
+        items  = []
+        urls   = []
 
-        # Try JSON-LD first
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                j = json.loads(script.string or "")
-                if isinstance(j, list): j = j[0]
-                if j.get("@type") in ("Product", "Offer"):
-                    p = j.get("offers", {}).get("price") or j.get("price")
-                    if p: prices.append(int(float(p)))
-                    items.append(j.get("name", ""))
-            except: pass
+        for res in soup.select(".result")[:8]:
+            snippet = res.get_text(" ", strip=True)
+            title_el = res.select_one(".result__title")
+            link_el  = res.select_one(".result__url")
 
-        # Try common price selectors
-        for sel in [".price", ".product-price", "[data-price]", ".selling-price", ".final-price", "span.price"]:
-            for el in soup.select(sel)[:10]:
-                txt = el.get_text(strip=True)
-                p = extract_price_from_text(txt)
-                if p: prices.append(p)
-
-        # Try product titles
-        for sel in [".product-name", ".product-title", "h3.title", ".item-name"]:
-            for el in soup.select(sel)[:3]:
-                items.append(el.get_text(strip=True)[:60])
+            # Extract all price-like numbers from snippet
+            nums = re.findall(r'(?:฿|THB|บาท)\s*([\d,]+)|([\d,]{3,6})\s*(?:฿|THB|บาท)', snippet)
+            for m in nums:
+                raw = (m[0] or m[1]).replace(",", "")
+                try:
+                    v = int(raw)
+                    if 50 <= v <= 500000:
+                        prices.append(v)
+                        if title_el: items.append(title_el.get_text(strip=True)[:60])
+                        if link_el:  urls.append(link_el.get_text(strip=True))
+                except: pass
 
         if debug:
-            st.caption(f"HD Mall prices found: {prices[:5]} | items: {items[:3]}")
+            st.caption(f"DDG [{site}] prices={prices[:5]}")
 
         if prices:
+            idx = prices.index(min(prices))
             return {
                 "found": True,
                 "minPrice": min(prices),
-                "maxPrice": max(prices) if len(prices) > 1 else min(prices),
+                "maxPrice": max(prices),
                 "discount": None,
-                "topItem": items[0][:60] if items else keyword,
-                "url": url,
-                "note": f"พบ {len(prices)} รายการ"
+                "topItem": items[idx] if idx < len(items) else keyword,
+                "url": urls[idx] if idx < len(urls) else f"https://{site}",
+                "note": f"พบ {len(set(prices))} ราคา via DDG"
             }
-        return {"found": False, "minPrice": None, "maxPrice": None, "discount": None,
-                "topItem": None, "url": url, "note": "ไม่พบราคาใน HTML"}
+        # fallback: try without site: filter but add site name in query
+        return {"found": False, "minPrice": None, "maxPrice": None,
+                "discount": None, "topItem": None,
+                "url": f"https://{site}", "note": "ไม่พบราคา"}
     except Exception as e:
-        return {"found": False, "minPrice": None, "maxPrice": None, "discount": None,
-                "topItem": None, "url": None, "note": f"error: {str(e)[:50]}"}
-
-
-def search_klook(keyword: str, debug: bool = False) -> dict:
-    try:
-        q = urllib.parse.quote(keyword)
-        url = f"https://www.klook.com/en-GB/search/?query={q}&countryCode=TH"
-        r = requests.get(url, headers=HEADERS, timeout=12)
-        soup = BeautifulSoup(r.text, "lxml")
-
-        if debug:
-            st.caption(f"Klook status: {r.status_code} | url: {url}")
-
-        prices = []
-        items = []
-
-        # Klook embeds data in __NEXT_DATA__ script
-        next_data = soup.find("script", id="__NEXT_DATA__")
-        if next_data:
-            try:
-                data = json.loads(next_data.string or "")
-                # Walk the JSON tree looking for price fields
-                def find_prices(obj, depth=0):
-                    if depth > 10: return
-                    if isinstance(obj, dict):
-                        for k, v in obj.items():
-                            if k in ("price", "fromPrice", "originalPrice", "discountPrice") and isinstance(v, (int, float)):
-                                if 50 <= v <= 999999: prices.append(int(v))
-                            elif k in ("title", "name", "activityName") and isinstance(v, str):
-                                items.append(v[:60])
-                            else:
-                                find_prices(v, depth+1)
-                    elif isinstance(obj, list):
-                        for item in obj[:20]:
-                            find_prices(item, depth+1)
-                find_prices(data)
-            except: pass
-
-        # Fallback: text selectors
-        for sel in [".price", ".from-price", "[class*='price']", "[class*='Price']"]:
-            for el in soup.select(sel)[:10]:
-                p = extract_price_from_text(el.get_text())
-                if p: prices.append(p)
-
-        if debug:
-            st.caption(f"Klook prices found: {prices[:5]} | items: {items[:3]}")
-
-        if prices:
-            return {
-                "found": True,
-                "minPrice": min(prices),
-                "maxPrice": max(prices) if len(prices) > 1 else min(prices),
-                "discount": None,
-                "topItem": items[0][:60] if items else keyword,
-                "url": url,
-                "note": f"พบ {len(prices)} รายการ"
-            }
-        return {"found": False, "minPrice": None, "maxPrice": None, "discount": None,
-                "topItem": None, "url": url, "note": "ไม่พบราคาใน HTML (อาจ JS-rendered)"}
-    except Exception as e:
-        return {"found": False, "minPrice": None, "maxPrice": None, "discount": None,
-                "topItem": None, "url": None, "note": f"error: {str(e)[:50]}"}
+        return {"found": False, "minPrice": None, "maxPrice": None,
+                "discount": None, "topItem": None, "url": None,
+                "note": f"error: {str(e)[:60]}"}
 
 
 def search_inhouse(keyword: str, shop_name: str, debug: bool = False) -> dict:
-    """Search shop's own website via DuckDuckGo."""
+    """Search shop's own website via DuckDuckGo, excluding platforms."""
     try:
-        clean_shop = re.sub(r'\(.*?\)', '', str(shop_name)).strip()
-        q = urllib.parse.quote(f"{clean_shop} {keyword} ราคา")
-        url = f"https://html.duckduckgo.com/html/?q={q}"
-        r = requests.get(url, headers=HEADERS, timeout=12)
-        soup = BeautifulSoup(r.text, "lxml")
+        clean_shop = re.sub(r'\(.*?\)', '', str(shop_name or "")).strip()
+        if not clean_shop or clean_shop == "nan":
+            return {"found": False, "minPrice": None, "maxPrice": None,
+                    "discount": None, "topItem": None, "url": None, "note": "ไม่มีชื่อร้าน"}
+
+        query = f'"{clean_shop}" {keyword} ราคา -gowabi -hdmall -klook'
+        q = urllib.parse.quote(query)
+        url = f"https://html.duckduckgo.com/html/?q={q}&kl=th-th"
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
 
         if debug:
-            st.caption(f"DuckDuckGo status: {r.status_code} | query: {clean_shop} {keyword} ราคา")
+            st.caption(f"In-house DDG status={r.status_code} query={query}")
 
-        results = soup.select(".result__body")[:5]
         prices = []
-        best_url = None
+        best_url   = None
         best_title = None
 
-        for res in results:
-            text = res.get_text()
-            # Skip Gowabi/HD Mall/Klook results — want own site
-            if any(x in text.lower() for x in ["gowabi", "hdmall", "klook"]):
+        for res in soup.select(".result")[:6]:
+            snippet = res.get_text(" ", strip=True)
+            if any(x in snippet.lower() for x in ["gowabi", "hdmall", "klook"]):
                 continue
-            p = extract_price_from_text(text)
-            if p:
-                prices.append(p)
-                link = res.select_one("a.result__url")
-                if link and not best_url:
-                    best_url = link.get("href", "")
-                title = res.select_one(".result__title")
-                if title and not best_title:
-                    best_title = title.get_text(strip=True)[:60]
+            nums = re.findall(r'(?:฿|THB|บาท)\s*([\d,]+)|([\d,]{3,6})\s*(?:฿|THB|บาท)', snippet)
+            for m in nums:
+                raw = (m[0] or m[1]).replace(",", "")
+                try:
+                    v = int(raw)
+                    if 50 <= v <= 500000:
+                        prices.append(v)
+                        if not best_url:
+                            link = res.select_one(".result__url")
+                            if link: best_url = link.get_text(strip=True)
+                        if not best_title:
+                            title = res.select_one(".result__title")
+                            if title: best_title = title.get_text(strip=True)[:60]
+                except: pass
 
         if debug:
-            st.caption(f"In-house prices: {prices[:5]}")
+            st.caption(f"In-house prices={prices[:5]}")
 
         if prices:
-            return {
-                "found": True,
-                "minPrice": min(prices),
-                "maxPrice": max(prices) if len(prices) > 1 else min(prices),
-                "discount": None,
-                "topItem": best_title or keyword,
-                "url": best_url,
-                "note": "จาก DuckDuckGo search"
-            }
-        return {"found": False, "minPrice": None, "maxPrice": None, "discount": None,
-                "topItem": None, "url": None, "note": "ไม่พบราคาบนเว็บร้าน"}
+            return {"found": True, "minPrice": min(prices), "maxPrice": max(prices),
+                    "discount": None, "topItem": best_title or clean_shop,
+                    "url": best_url, "note": "จาก DuckDuckGo"}
+        return {"found": False, "minPrice": None, "maxPrice": None,
+                "discount": None, "topItem": None, "url": None, "note": "ไม่พบราคาบนเว็บร้าน"}
     except Exception as e:
-        return {"found": False, "minPrice": None, "maxPrice": None, "discount": None,
-                "topItem": None, "url": None, "note": f"error: {str(e)[:50]}"}
+        return {"found": False, "minPrice": None, "maxPrice": None,
+                "discount": None, "topItem": None, "url": None, "note": f"error: {str(e)[:50]}"}
 
 
 def search_competitor_prices(api_key, service_name, shop_name, platforms, debug=False):
@@ -286,14 +208,17 @@ def search_competitor_prices(api_key, service_name, shop_name, platforms, debug=
     results = []
     for p in platforms:
         if p == "HD Mall":
-            r = search_hdmall(core_name, debug=debug)
+            r = ddg_search_price(core_name, "hdmall.co.th", debug=debug)
         elif p == "Klook":
-            r = search_klook(core_name, debug=debug)
+            r = ddg_search_price(core_name, "klook.com", debug=debug)
         else:
             r = search_inhouse(core_name, shop_name, debug=debug)
         r["platform"] = p
         results.append(r)
-        time.sleep(1)
+        time.sleep(1.5)
+    return {"search_keyword": core_name, "results": results}
+
+
     return {"search_keyword": core_name, "results": results}
 
 
@@ -401,23 +326,18 @@ if search_hdmall:  active_platforms.append("HD Mall")
 if search_klook:   active_platforms.append("Klook")
 if search_inhouse: active_platforms.append("เว็บร้านเอง")
 
-if not api_key:
-    st.error("⚠️ กรุณาใส่ Anthropic API Key ในแถบซ้ายมือ")
-    st.stop()
 if not active_platforms:
     st.warning("⚠️ กรุณาเลือก Platform อย่างน้อย 1 อัน")
     st.stop()
 
 # ── Run ──
 if st.button("🔍 เริ่มค้นหาราคา", type="primary", use_container_width=True):
-    # Time estimate: ~15-20 sec per row (3 platforms × ~5s each + delays)
-    est_min = len(df_filtered) * 15 // 60
-    est_max = len(df_filtered) * 25 // 60
-    est_sec = len(df_filtered) * 20
+    est_sec = len(df_filtered) * 6   # ~2s per platform × 3 + overhead
     if est_sec < 60:
-        st.info(f"⏱️ ประมาณเวลา: **{est_sec} วินาที** ({len(df_filtered)} รายการ × ~20 วิ/รายการ)")
+        st.info(f"⏱️ ประมาณเวลา: **{est_sec} วินาที** ({len(df_filtered)} รายการ × ~6 วิ/รายการ)")
     else:
-        st.info(f"⏱️ ประมาณเวลา: **{est_min}–{est_max} นาที** ({len(df_filtered)} รายการ × ~20 วิ/รายการ) — ช้าแต่ได้ผลลัพธ์จริงครับ")
+        est_min = est_sec // 60
+        st.info(f"⏱️ ประมาณเวลา: **~{est_min} นาที** ({len(df_filtered)} รายการ)")
     total = len(df_filtered)
     results_store = [None] * total
 
